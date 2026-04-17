@@ -41,6 +41,9 @@ MAX_ACTIVE_TICKETS_PER_USER = int(os.getenv('MAX_ACTIVE_TICKETS_PER_USER', '1'))
 SYNC_COMMANDS_ON_START = os.getenv('SYNC_COMMANDS_ON_START', 'true').lower() == 'true'
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
 GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+GEMINI_MAX_RETRIES = int(os.getenv('GEMINI_MAX_RETRIES', '5'))
+GEMINI_RETRY_BASE_DELAY = float(os.getenv('GEMINI_RETRY_BASE_DELAY', '2.0'))
+GEMINI_RETRY_MAX_DELAY = float(os.getenv('GEMINI_RETRY_MAX_DELAY', '20.0'))
 
 if not DISCORD_TOKEN:
     raise RuntimeError('Переменная окружения DISCORD_TOKEN не задана')
@@ -122,9 +125,12 @@ def slugify(text: str) -> str:
 
 
 class GeminiRecognizer:
-    def __init__(self, api_key: str, model_name: str):
+    def __init__(self, api_key: str, model_name: str, max_retries: int = 5, retry_base_delay: float = 2.0, retry_max_delay: float = 20.0):
         self.client = genai.Client(api_key=api_key)
         self.model_name = model_name
+        self.max_retries = max(1, max_retries)
+        self.retry_base_delay = max(0.5, retry_base_delay)
+        self.retry_max_delay = max(self.retry_base_delay, retry_max_delay)
         self.allowed_names = sorted(ITEM_PRICES.keys())
         self.response_schema = {
             'type': 'object',
@@ -210,7 +216,26 @@ class GeminiRecognizer:
             note = 'Gemini вернул ответ без пояснения.'
         return lines, note
 
-    def _analyze_sync(self, image_bytes: bytes, mime_type: str) -> tuple[list[ResourceLine], int, str]:
+    def _is_retryable_exception(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        retry_markers = [
+            '503',
+            'service unavailable',
+            'currently experiencing high demand',
+            'try again later',
+            'deadline exceeded',
+            'timed out',
+            'timeout',
+            'temporarily unavailable',
+            'internal error',
+            'connection reset',
+            'connection aborted',
+            'connection error',
+            'unavailable',
+        ]
+        return any(marker in message for marker in retry_markers)
+
+    def _request_payload(self, image_bytes: bytes, mime_type: str) -> dict[str, Any]:
         prompt = (
             'Определи все предметы на скриншоте и их количества. '
             'Верни только JSON по заданной схеме. '
@@ -238,17 +263,40 @@ class GeminiRecognizer:
             raise RuntimeError('Gemini вернул пустой ответ')
 
         try:
-            payload = json.loads(text)
+            return json.loads(text)
         except json.JSONDecodeError as exc:
             raise RuntimeError(f'Gemini вернул некорректный JSON: {exc}') from exc
 
-        lines, note = self._normalize_items(payload)
-        if not lines:
-            raise RuntimeError(f'Gemini не нашел предметы. Ответ: {note}')
+    def _analyze_sync(self, image_bytes: bytes, mime_type: str) -> tuple[list[ResourceLine], int, str]:
+        last_exc: Exception | None = None
 
-        total = sum(line.subtotal for line in lines)
-        note = f'{note} Модель: {self.model_name}. Найдено строк: {len(lines)}.'
-        return lines, total, note
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                payload = self._request_payload(image_bytes, mime_type)
+                lines, note = self._normalize_items(payload)
+                if not lines:
+                    raise RuntimeError(f'Gemini не нашел предметы. Ответ: {note}')
+
+                total = sum(line.subtotal for line in lines)
+                retry_note = '' if attempt == 1 else f' После {attempt} попыток.'
+                note = f'{note} Модель: {self.model_name}. Найдено строк: {len(lines)}.{retry_note}'
+                return lines, total, note
+            except Exception as exc:
+                last_exc = exc
+                is_retryable = self._is_retryable_exception(exc)
+                logger.warning('Gemini attempt %s/%s failed: %s', attempt, self.max_retries, exc)
+                if attempt >= self.max_retries or not is_retryable:
+                    break
+                delay = min(self.retry_base_delay * (2 ** (attempt - 1)), self.retry_max_delay)
+                logger.info('Retrying Gemini request in %.1f seconds', delay)
+                import time
+                time.sleep(delay)
+
+        assert last_exc is not None
+        raise RuntimeError(
+            'Gemini временно недоступен после нескольких попыток. '
+            f'Последняя ошибка: {last_exc}'
+        ) from last_exc
 
     async def analyze(self, attachment: discord.Attachment) -> tuple[list[ResourceLine], int, str]:
         image_bytes = await attachment.read()
@@ -256,7 +304,13 @@ class GeminiRecognizer:
         return await asyncio.to_thread(self._analyze_sync, image_bytes, mime_type)
 
 
-recognizer = GeminiRecognizer(api_key=GEMINI_API_KEY, model_name=GEMINI_MODEL)
+recognizer = GeminiRecognizer(
+    api_key=GEMINI_API_KEY,
+    model_name=GEMINI_MODEL,
+    max_retries=GEMINI_MAX_RETRIES,
+    retry_base_delay=GEMINI_RETRY_BASE_DELAY,
+    retry_max_delay=GEMINI_RETRY_MAX_DELAY,
+)
 
 
 class CloseTicketView(discord.ui.View):
