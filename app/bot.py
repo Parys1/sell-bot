@@ -36,6 +36,7 @@ GUILD_ID = os.getenv('GUILD_ID', '')
 STAFF_ROLE_ID = os.getenv('STAFF_ROLE_ID', '')
 TICKETS_CATEGORY_ID = os.getenv('TICKETS_CATEGORY_ID', '')
 TICKET_CHANNEL_PREFIX = os.getenv('TICKET_CHANNEL_PREFIX', 'sell')
+SELL_COMMAND_CHANNEL_ID = os.getenv('SELL_COMMAND_CHANNEL_ID', '')
 COMMAND_NAME = os.getenv('COMMAND_NAME', 'sell')
 COMMAND_DESCRIPTION = os.getenv('COMMAND_DESCRIPTION', 'Создать заявку на продажу ресурсов')
 CURRENCY_NAME = os.getenv('CURRENCY_NAME', '₽')
@@ -56,6 +57,7 @@ def _to_int(value: str) -> int | None:
 GUILD_ID_INT = _to_int(GUILD_ID)
 STAFF_ROLE_ID_INT = _to_int(STAFF_ROLE_ID)
 TICKETS_CATEGORY_ID_INT = _to_int(TICKETS_CATEGORY_ID)
+SELL_COMMAND_CHANNEL_ID_INT = _to_int(SELL_COMMAND_CHANNEL_ID)
 
 
 @dataclass
@@ -309,14 +311,20 @@ class SellBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         self.add_view(CloseTicketView())
-        self.tree.add_command(build_sell_command())
 
-        if SYNC_COMMANDS_ON_START:
-            if GUILD_ID_INT:
-                guild_obj = discord.Object(id=GUILD_ID_INT)
+        if GUILD_ID_INT:
+            guild_obj = discord.Object(id=GUILD_ID_INT)
+            self.tree.add_command(build_sell_command(), guild=guild_obj)
+            self.tree.add_command(ping_command, guild=guild_obj)
+
+            if SYNC_COMMANDS_ON_START:
                 synced = await self.tree.sync(guild=guild_obj)
                 logger.info('Синхронизировано %s команд в guild %s', len(synced), GUILD_ID_INT)
-            else:
+        else:
+            self.tree.add_command(build_sell_command())
+            self.tree.add_command(ping_command)
+
+            if SYNC_COMMANDS_ON_START:
                 synced = await self.tree.sync()
                 logger.info('Глобально синхронизировано %s команд', len(synced))
 
@@ -370,6 +378,13 @@ def build_sell_command() -> app_commands.Command:
     async def sell_resources(interaction: discord.Interaction, nick: str, screenshot: discord.Attachment):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message('Эту команду можно использовать только на сервере.', ephemeral=True)
+            return
+
+        if SELL_COMMAND_CHANNEL_ID_INT and interaction.channel_id != SELL_COMMAND_CHANNEL_ID_INT:
+            await interaction.response.send_message(
+                f'Эту команду можно использовать только в канале <#{SELL_COMMAND_CHANNEL_ID_INT}>.',
+                ephemeral=True
+            )
             return
 
         if MAX_ACTIVE_TICKETS_PER_USER > 0:
@@ -448,8 +463,8 @@ def build_sell_command() -> app_commands.Command:
     return sell_resources
 
 
-@bot.tree.command(name='ping', description='Проверить, что бот работает')
-async def ping(interaction: discord.Interaction):
+@app_commands.command(name='ping', description='Проверить, что бот работает')
+async def ping_command(interaction: discord.Interaction):
     await interaction.response.send_message('Pong! Бот работает.', ephemeral=True)
 
 
