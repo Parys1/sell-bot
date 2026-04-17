@@ -226,11 +226,44 @@ class HybridInventoryRecognizer:
         return [int(round(sum(g) / len(g))) for g in groups]
 
     def _find_axis_lines(self, gray: np.ndarray, axis: int) -> list[int]:
-        dark = (gray < 42).astype(np.float32)
+        dark = (gray < 52).astype(np.float32)
         projection = dark.mean(axis=axis)
-        threshold = 0.18 if axis == 0 else 0.22
-        positions = np.where(projection > threshold)[0]
-        return self._group_positions(positions)
+        thresholds = [0.20, 0.16, 0.12, 0.08]
+        for threshold in thresholds:
+            positions = np.where(projection > threshold)[0]
+            grouped = self._group_positions(positions)
+            if len(grouped) >= 2:
+                return grouped
+        return []
+
+    def _periodic_projection_lines(self, gray: np.ndarray, axis: int, min_step: int = 46, max_step: int = 62) -> list[int]:
+        dark = (gray < 60).astype(np.float32)
+        projection = dark.mean(axis=axis)
+        limit = projection.shape[0]
+        best_score = -1.0
+        best_offset = 0
+        best_step = 52
+
+        for step in range(min_step, max_step + 1):
+            for offset in range(step):
+                sample = projection[offset:limit:step]
+                if sample.size < 3:
+                    continue
+                score = float(sample.mean() + sample.max() * 0.35)
+                if score > best_score:
+                    best_score = score
+                    best_offset = offset
+                    best_step = step
+
+        lines = list(range(best_offset, limit, best_step))
+        trimmed: list[int] = []
+        for pos in lines:
+            lo = max(0, pos - 2)
+            hi = min(limit, pos + 3)
+            local = projection[lo:hi]
+            if local.size and float(local.max()) >= 0.05:
+                trimmed.append(pos)
+        return trimmed
 
     def _select_periodic(self, lines: list[int], min_step: int = 38, max_step: int = 90) -> list[int]:
         if len(lines) < 3:
@@ -254,12 +287,20 @@ class HybridInventoryRecognizer:
         if icon.size == 0:
             return False
         gray = cv2.cvtColor(icon, cv2.COLOR_BGR2GRAY)
-        return float(gray.std()) > 10.0 or float(gray.mean()) > 45.0
+        return float(gray.std()) > 9.0 or float(gray.mean()) > 42.0
 
-    def _extract_cells(self, bgr: np.ndarray) -> list[dict[str, Any]]:
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        x_lines = self._select_periodic(self._find_axis_lines(gray, axis=0))
-        y_lines = self._select_periodic(self._find_axis_lines(gray, axis=1))
+    def _cell_border_score(self, cell: np.ndarray) -> float:
+        gray = cv2.cvtColor(cell, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape[:2]
+        border = np.concatenate([
+            gray[:2, :].reshape(-1),
+            gray[max(0, h - 2):h, :].reshape(-1),
+            gray[:, :2].reshape(-1),
+            gray[:, max(0, w - 2):w].reshape(-1),
+        ])
+        return float((border < 70).mean())
+
+    def _build_cells_from_lines(self, bgr: np.ndarray, x_lines: list[int], y_lines: list[int]) -> list[dict[str, Any]]:
         cells: list[dict[str, Any]] = []
         idx = 0
         for yi in range(len(y_lines) - 1):
@@ -271,11 +312,44 @@ class HybridInventoryRecognizer:
                 if not (38 <= w <= 90 and 38 <= h <= 95):
                     continue
                 cell = bgr[max(0, y0 + 1):min(bgr.shape[0], y1 - 1), max(0, x0 + 1):min(bgr.shape[1], x1 - 1)]
-                if cell.size == 0 or not self._cell_occupied(cell):
+                if cell.size == 0:
+                    continue
+                if self._cell_border_score(cell) < 0.45:
+                    continue
+                if not self._cell_occupied(cell):
                     continue
                 idx += 1
                 cells.append({'index': idx, 'x': x0, 'y': y0, 'w': w, 'h': h, 'image': cell})
         cells.sort(key=lambda c: (c['y'], c['x']))
+        return cells
+
+    def _save_debug_grid(self, bgr: np.ndarray, x_lines: list[int], y_lines: list[int], cells: list[dict[str, Any]]) -> None:
+        try:
+            debug = bgr.copy()
+            for x in x_lines:
+                cv2.line(debug, (x, 0), (x, debug.shape[0] - 1), (255, 0, 0), 1)
+            for y in y_lines:
+                cv2.line(debug, (0, y), (debug.shape[1] - 1, y), (0, 255, 0), 1)
+            for cell in cells:
+                cv2.rectangle(debug, (cell['x'], cell['y']), (cell['x'] + cell['w'], cell['y'] + cell['h']), (0, 0, 255), 1)
+            cv2.imwrite(str(DATA_DIR / 'debug_grid.png'), debug)
+        except Exception:
+            logger.exception('Не удалось сохранить debug_grid.png')
+
+    def _extract_cells(self, bgr: np.ndarray) -> list[dict[str, Any]]:
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        x_lines = self._select_periodic(self._find_axis_lines(gray, axis=0))
+        y_lines = self._select_periodic(self._find_axis_lines(gray, axis=1))
+        cells = self._build_cells_from_lines(bgr, x_lines, y_lines)
+
+        if len(cells) < 2:
+            fallback_x = self._periodic_projection_lines(gray, axis=0)
+            fallback_y = self._periodic_projection_lines(gray, axis=1)
+            fallback_cells = self._build_cells_from_lines(bgr, fallback_x, fallback_y)
+            if len(fallback_cells) > len(cells):
+                x_lines, y_lines, cells = fallback_x, fallback_y, fallback_cells
+
+        self._save_debug_grid(bgr, x_lines, y_lines, cells)
         return cells
 
     def _ocr_amount(self, cell: np.ndarray) -> tuple[int | None, str]:
