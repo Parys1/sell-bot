@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -10,12 +11,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import cv2
 import discord
+import numpy as np
+import pytesseract
 from discord import app_commands
 from discord.ext import commands
 from openai import OpenAI
 
-from item_catalog import ITEM_PRICES
+from item_catalog import ITEM_PRICES, TEMPLATE_ALIASES
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,6 +31,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / 'data'
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 TICKETS_DB = DATA_DIR / 'tickets.json'
+TEMPLATES_DIR = BASE_DIR / 'app' / 'item_templates'
 
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN', '')
 GUILD_ID = os.getenv('GUILD_ID', '')
@@ -47,7 +52,6 @@ GROQ_RETRY_MAX_DELAY = float(os.getenv('GROQ_RETRY_MAX_DELAY', '15.0'))
 
 if not DISCORD_TOKEN:
     raise RuntimeError('Переменная окружения DISCORD_TOKEN не задана')
-
 if not GROQ_API_KEY:
     raise RuntimeError('Переменная окружения GROQ_API_KEY не задана')
 
@@ -124,190 +128,299 @@ def slugify(text: str) -> str:
     return value[:40] or 'user'
 
 
-class GroqRecognizer:
-    def __init__(
-        self,
-        api_key: str,
-        model_name: str,
-        max_retries: int = 4,
-        retry_base_delay: float = 1.5,
-        retry_max_delay: float = 15.0,
-    ):
-        self.client = OpenAI(api_key=api_key, base_url='https://api.groq.com/openai/v1')
-        self.model_name = model_name
-        self.max_retries = max(1, max_retries)
-        self.retry_base_delay = max(0.5, retry_base_delay)
-        self.retry_max_delay = max(self.retry_base_delay, retry_max_delay)
-        self.allowed_names = sorted(ITEM_PRICES.keys())
-        self.response_schema = {
-            'type': 'object',
-            'properties': {
-                'items': {
-                    'type': 'array',
-                    'items': {
-                        'type': 'object',
-                        'properties': {
-                            'name': {'type': 'string', 'enum': self.allowed_names},
-                            'amount': {'type': 'integer', 'minimum': 1},
-                        },
-                        'required': ['name', 'amount'],
-                        'additionalProperties': False,
-                    },
-                },
-                'analysis_note': {'type': 'string'},
-            },
-            'required': ['items', 'analysis_note'],
-            'additionalProperties': False,
-        }
-        allowed = '\n'.join(f'- {name}' for name in self.allowed_names)
-        self.system_prompt = (
-            'Ты анализируешь скриншоты игрового инвентаря и возвращаешь только JSON по схеме. '
-            'На изображении может быть один предмет или сетка из многих предметов. '
-            'Нужно определить каждый видимый предмет и его количество. '
-            'Количество обычно показано в правом верхнем углу ячейки в формате 1x, 23x, 46x. '
-            'Если счетчик неразборчив, ставь 1. '
-            'Используй только точные названия из списка ниже. '
-            'Не придумывай новые названия, не добавляй цены, не пиши текст вне JSON. '
-            'Если в нескольких ячейках один и тот же предмет, верни несколько элементов, код потом их суммирует. '
-            'Если не уверен в каком-то предмете, пропусти его и кратко напиши об этом в analysis_note. '
-            'Разрешенные названия:\n'
-            f'{allowed}'
-        )
+class TemplateIndex:
+    def __init__(self, templates_dir: Path):
+        self.templates_dir = templates_dir
+        self.templates: list[dict[str, Any]] = []
+        self._load_templates()
+
+    def _canonical_name(self, template_name: str) -> str:
+        return TEMPLATE_ALIASES.get(template_name, template_name)
+
+    def _icon_region(self, image: np.ndarray) -> np.ndarray:
+        h, w = image.shape[:2]
+        x0 = max(0, int(w * 0.10))
+        x1 = min(w, int(w * 0.88))
+        y0 = max(0, int(h * 0.16))
+        y1 = min(h, int(h * 0.78))
+        return image[y0:y1, x0:x1]
+
+    def _feature(self, image: np.ndarray) -> np.ndarray:
+        icon = self._icon_region(image)
+        if icon.size == 0:
+            icon = image
+        gray = cv2.cvtColor(icon, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, (48, 48), interpolation=cv2.INTER_AREA)
+        edges = cv2.Canny(gray, 40, 120)
+        hist = cv2.calcHist([gray], [0], None, [16], [0, 256]).flatten()
+        hist = hist / (hist.sum() + 1e-6)
+        vec = np.concatenate([
+            gray.astype(np.float32).flatten() / 255.0,
+            edges.astype(np.float32).flatten() / 255.0,
+            hist.astype(np.float32),
+        ])
+        return vec
+
+    def _load_templates(self) -> None:
+        if not self.templates_dir.exists():
+            return
+        for path in sorted(self.templates_dir.glob('*.png')):
+            raw = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+            if raw is None:
+                continue
+            if raw.shape[2] == 4:
+                alpha = raw[:, :, 3:4].astype(np.float32) / 255.0
+                rgb = raw[:, :, :3].astype(np.float32)
+                bg = np.full_like(rgb, 32)
+                bgr = (rgb * alpha + bg * (1 - alpha)).astype(np.uint8)
+            else:
+                bgr = raw[:, :, :3]
+            name = self._canonical_name(path.stem.lower())
+            if name not in ITEM_PRICES:
+                continue
+            self.templates.append({'name': name, 'feature': self._feature(bgr)})
+        logger.info('Загружено шаблонов для подсказок: %s', len(self.templates))
+
+    def candidates(self, bgr_image: np.ndarray, top_k: int = 8) -> list[tuple[str, float]]:
+        if not self.templates:
+            return []
+        feat = self._feature(bgr_image)
+        scores: list[tuple[str, float]] = []
+        for template in self.templates:
+            dist = float(np.mean((feat - template['feature']) ** 2))
+            score = max(0.0, 1.0 - min(dist / 0.25, 1.0))
+            scores.append((template['name'], score))
+        by_name: dict[str, float] = {}
+        for name, score in scores:
+            by_name[name] = max(by_name.get(name, 0.0), score)
+        return sorted(by_name.items(), key=lambda x: x[1], reverse=True)[:top_k]
+
+
+def encode_png_data_uri(bgr_image: np.ndarray) -> str:
+    ok, encoded = cv2.imencode('.png', bgr_image)
+    if not ok:
+        raise RuntimeError('Не удалось закодировать crop в PNG')
+    b64 = base64.b64encode(encoded.tobytes()).decode('ascii')
+    return f'data:image/png;base64,{b64}'
+
+
+class HybridInventoryRecognizer:
+    def __init__(self):
+        self.client = OpenAI(api_key=GROQ_API_KEY, base_url='https://api.groq.com/openai/v1')
+        self.model_name = GROQ_MODEL
+        self.max_retries = max(1, GROQ_MAX_RETRIES)
+        self.retry_base_delay = max(0.5, GROQ_RETRY_BASE_DELAY)
+        self.retry_max_delay = max(self.retry_base_delay, GROQ_RETRY_MAX_DELAY)
+        self.template_index = TemplateIndex(TEMPLATES_DIR)
+
+    def _group_positions(self, positions: np.ndarray, min_gap: int = 4) -> list[int]:
+        if positions.size == 0:
+            return []
+        groups: list[list[int]] = [[int(positions[0])]]
+        for pos in positions[1:]:
+            p = int(pos)
+            if p - groups[-1][-1] <= min_gap:
+                groups[-1].append(p)
+            else:
+                groups.append([p])
+        return [int(round(sum(g) / len(g))) for g in groups]
+
+    def _find_axis_lines(self, gray: np.ndarray, axis: int) -> list[int]:
+        dark = (gray < 42).astype(np.float32)
+        projection = dark.mean(axis=axis)
+        threshold = 0.18 if axis == 0 else 0.22
+        positions = np.where(projection > threshold)[0]
+        return self._group_positions(positions)
+
+    def _select_periodic(self, lines: list[int], min_step: int = 38, max_step: int = 90) -> list[int]:
+        if len(lines) < 3:
+            return lines
+        best: list[int] = []
+        for i in range(len(lines)):
+            current = [lines[i]]
+            last = lines[i]
+            for j in range(i + 1, len(lines)):
+                step = lines[j] - last
+                if min_step <= step <= max_step:
+                    current.append(lines[j])
+                    last = lines[j]
+            if len(current) > len(best):
+                best = current
+        return best or lines
+
+    def _cell_occupied(self, cell: np.ndarray) -> bool:
+        h, w = cell.shape[:2]
+        icon = cell[int(h * 0.18):int(h * 0.78), int(w * 0.12):int(w * 0.88)]
+        if icon.size == 0:
+            return False
+        gray = cv2.cvtColor(icon, cv2.COLOR_BGR2GRAY)
+        return float(gray.std()) > 10.0 or float(gray.mean()) > 45.0
+
+    def _extract_cells(self, bgr: np.ndarray) -> list[dict[str, Any]]:
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        x_lines = self._select_periodic(self._find_axis_lines(gray, axis=0))
+        y_lines = self._select_periodic(self._find_axis_lines(gray, axis=1))
+        cells: list[dict[str, Any]] = []
+        idx = 0
+        for yi in range(len(y_lines) - 1):
+            for xi in range(len(x_lines) - 1):
+                x0, x1 = x_lines[xi], x_lines[xi + 1]
+                y0, y1 = y_lines[yi], y_lines[yi + 1]
+                w = x1 - x0
+                h = y1 - y0
+                if not (38 <= w <= 90 and 38 <= h <= 95):
+                    continue
+                cell = bgr[max(0, y0 + 1):min(bgr.shape[0], y1 - 1), max(0, x0 + 1):min(bgr.shape[1], x1 - 1)]
+                if cell.size == 0 or not self._cell_occupied(cell):
+                    continue
+                idx += 1
+                cells.append({'index': idx, 'x': x0, 'y': y0, 'w': w, 'h': h, 'image': cell})
+        cells.sort(key=lambda c: (c['y'], c['x']))
+        return cells
+
+    def _ocr_amount(self, cell: np.ndarray) -> tuple[int | None, str]:
+        h, w = cell.shape[:2]
+        crop = cell[0:max(12, int(h * 0.26)), max(0, int(w * 0.56)):w]
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, None, fx=5, fy=5, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        candidates: list[str] = []
+        for invert in (False, True):
+            current = 255 - gray if invert else gray
+            for threshold in (90, 120, 150, 180, 210):
+                _, binary = cv2.threshold(current, threshold, 255, cv2.THRESH_BINARY)
+                text = pytesseract.image_to_string(binary, config='--psm 7 -c tessedit_char_whitelist=0123456789xX')
+                norm = text.strip().lower().replace('х', 'x').replace(' ', '')
+                if norm:
+                    candidates.append(norm)
+        nums: list[int] = []
+        for candidate in candidates:
+            match = re.search(r'(\d{1,4})', candidate)
+            if match:
+                try:
+                    nums.append(int(match.group(1)))
+                except ValueError:
+                    pass
+        if not nums:
+            return None, ', '.join(candidates[:5]) or 'пусто'
+        counts: dict[int, int] = defaultdict(int)
+        for num in nums:
+            counts[num] += 1
+        amount = max(counts.items(), key=lambda x: (x[1], len(str(x[0]))))[0]
+        return amount, ', '.join(candidates[:5])
 
     def _is_retryable_exception(self, exc: Exception) -> bool:
         message = str(exc).lower()
-        markers = [
-            '429',
-            '500',
-            '502',
-            '503',
-            '504',
-            'rate limit',
-            'service unavailable',
-            'overloaded',
-            'temporarily unavailable',
-            'timeout',
-            'timed out',
-            'connection error',
-            'internal server error',
-            'try again',
-        ]
+        markers = ['429', '500', '502', '503', '504', 'rate limit', 'service unavailable', 'overloaded', 'temporarily unavailable', 'timeout', 'timed out', 'connection error', 'internal server error', 'try again']
         return any(marker in message for marker in markers)
 
-    def _normalize_items(self, payload: dict[str, Any]) -> tuple[list[ResourceLine], str]:
-        totals: dict[str, int] = defaultdict(int)
-        invalid_items: list[str] = []
-
-        for item in payload.get('items', []):
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get('name', '')).strip()
-            amount_raw = item.get('amount', 1)
-            if name not in ITEM_PRICES:
-                if name:
-                    invalid_items.append(name)
-                continue
+    def _classify_cell(self, cell: np.ndarray, candidates: list[tuple[str, float]]) -> tuple[str | None, float, str]:
+        candidate_names = [name for name, _ in candidates][:8]
+        if not candidate_names:
+            return None, 0.0, 'нет кандидатов'
+        data_uri = encode_png_data_uri(cell)
+        schema = {
+            'type': 'object',
+            'properties': {
+                'name': {'anyOf': [{'type': 'string', 'enum': candidate_names}, {'type': 'null'}]},
+                'confidence': {'type': 'number'},
+                'note': {'type': 'string'},
+            },
+            'required': ['name', 'confidence', 'note'],
+            'additionalProperties': False,
+        }
+        sys_prompt = (
+            'Ты видишь одну игровую ячейку инвентаря. '
+            'Определи название предмета только из списка кандидатов. '
+            'Счетчик количества в правом верхнем углу и вес внизу игнорируй. '
+            'Смотри только на сам предмет по центру ячейки. '
+            'Если не уверен, верни name=null и низкую confidence. '
+            'Кандидаты:\n- ' + '\n- '.join(candidate_names)
+        )
+        last_exc: Exception | None = None
+        for attempt in range(1, self.max_retries + 1):
             try:
-                amount = int(amount_raw)
-            except (TypeError, ValueError):
+                completion = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[
+                        {'role': 'system', 'content': sys_prompt},
+                        {'role': 'user', 'content': [
+                            {'type': 'text', 'text': 'Определи предмет в этой одной ячейке. Верни только JSON.'},
+                            {'type': 'image_url', 'image_url': {'url': data_uri}},
+                        ]},
+                    ],
+                    temperature=0.0,
+                    response_format={'type': 'json_schema', 'json_schema': {'name': 'cell_item', 'strict': False, 'schema': schema}},
+                )
+                text = (completion.choices[0].message.content or '').strip()
+                payload = json.loads(text)
+                name = payload.get('name')
+                confidence = float(payload.get('confidence', 0.0) or 0.0)
+                note = str(payload.get('note', '')).strip()
+                if name is not None and name not in candidate_names:
+                    name = None
+                    confidence = 0.0
+                return name, confidence, note
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= self.max_retries or not self._is_retryable_exception(exc):
+                    break
+                delay = min(self.retry_base_delay * (2 ** (attempt - 1)), self.retry_max_delay)
+                logger.warning('Groq cell classify retry %s/%s: %s', attempt, self.max_retries, exc)
+                time.sleep(delay)
+        if last_exc:
+            logger.warning('Groq cell classify failed: %s', last_exc)
+        return None, 0.0, f'ошибка vision: {last_exc}' if last_exc else 'ошибка vision'
+
+    def _analyze_sync(self, image_bytes: bytes) -> tuple[list[ResourceLine], int, str]:
+        raw = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if raw is None:
+            raise RuntimeError('Не удалось прочитать изображение')
+
+        cells = self._extract_cells(raw)
+        if not cells:
+            raise RuntimeError('Не удалось выделить ячейки инвентаря на скрине')
+
+        totals: dict[str, int] = defaultdict(int)
+        skipped: list[str] = []
+        recognized = 0
+
+        for cell_info in cells:
+            cell = cell_info['image']
+            amount, ocr_raw = self._ocr_amount(cell)
+            if amount is None:
                 amount = 1
-            if amount < 1:
-                amount = 1
+            candidates = self.template_index.candidates(cell, top_k=8)
+            name, confidence, vision_note = self._classify_cell(cell, candidates)
+            if not name or confidence < 0.45:
+                cand_text = '; '.join(f'{n} ({s:.3f})' for n, s in candidates[:3]) or 'нет'
+                skipped.append(
+                    f'ячейка {cell_info["index"]}: неуверенно, OCR={amount}, top={cand_text}, vision={vision_note or "пусто"}'
+                )
+                continue
             totals[name] += amount
+            recognized += 1
 
         lines = [
             ResourceLine(name=name, amount=amount, price_per_unit=ITEM_PRICES[name])
             for name, amount in sorted(totals.items())
         ]
+        total = sum(line.subtotal for line in lines)
 
-        note = str(payload.get('analysis_note', '')).strip()
-        if invalid_items:
-            suffix = ' Игнорированы недопустимые названия: ' + ', '.join(sorted(set(invalid_items)))
-            note = f'{note}{suffix}'.strip()
-        if not note:
-            note = 'Groq вернул ответ без пояснения.'
-        return lines, note
+        if not lines:
+            raise RuntimeError('Ни один предмет не распознан уверенно. ' + ' | '.join(skipped[:8]))
 
-    def _request_payload(self, image_url: str) -> dict[str, Any]:
-        completion = self.client.chat.completions.create(
-            model=self.model_name,
-            messages=[
-                {'role': 'system', 'content': self.system_prompt},
-                {
-                    'role': 'user',
-                    'content': [
-                        {
-                            'type': 'text',
-                            'text': (
-                                'Определи все предметы на скриншоте и их количества. '
-                                'Верни только JSON по схеме. '
-                                'Если на скрине много предметов, обработай всю сетку полностью.'
-                            ),
-                        },
-                        {
-                            'type': 'image_url',
-                            'image_url': {'url': image_url},
-                        },
-                    ],
-                },
-            ],
-            temperature=0.1,
-            response_format={
-                'type': 'json_schema',
-                'json_schema': {
-                    'name': 'inventory_items',
-                    'strict': False,
-                    'schema': self.response_schema,
-                },
-            },
-        )
-
-        text = (completion.choices[0].message.content or '').strip()
-        if not text:
-            raise RuntimeError('Groq вернул пустой ответ')
-
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f'Groq вернул некорректный JSON: {exc}. Ответ: {text[:500]}') from exc
-
-    def _analyze_sync(self, image_url: str) -> tuple[list[ResourceLine], int, str]:
-        last_exc: Exception | None = None
-
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                payload = self._request_payload(image_url)
-                lines, note = self._normalize_items(payload)
-                if not lines:
-                    raise RuntimeError(f'Groq не нашел предметы. Ответ: {note}')
-
-                total = sum(line.subtotal for line in lines)
-                retry_note = '' if attempt == 1 else f' После {attempt} попыток.'
-                note = f'{note} Модель: {self.model_name}. Найдено строк: {len(lines)}.{retry_note}'
-                return lines, total, note
-            except Exception as exc:
-                last_exc = exc
-                logger.warning('Groq attempt %s/%s failed: %s', attempt, self.max_retries, exc)
-                if attempt >= self.max_retries or not self._is_retryable_exception(exc):
-                    break
-                delay = min(self.retry_base_delay * (2 ** (attempt - 1)), self.retry_max_delay)
-                logger.info('Retrying Groq request in %.1f seconds', delay)
-                time.sleep(delay)
-
-        assert last_exc is not None
-        raise RuntimeError(f'Groq недоступен или не смог корректно распознать изображение. Последняя ошибка: {last_exc}') from last_exc
+        note = f'Распознано ячеек: {recognized}/{len(cells)}'
+        if skipped:
+            note += f' | пропущено: {len(skipped)} | ' + ' | '.join(skipped[:6])
+        return lines, total, note
 
     async def analyze(self, attachment: discord.Attachment) -> tuple[list[ResourceLine], int, str]:
-        return await asyncio.to_thread(self._analyze_sync, attachment.url)
+        image_bytes = await attachment.read()
+        return await asyncio.to_thread(self._analyze_sync, image_bytes)
 
 
-recognizer = GroqRecognizer(
-    api_key=GROQ_API_KEY,
-    model_name=GROQ_MODEL,
-    max_retries=GROQ_MAX_RETRIES,
-    retry_base_delay=GROQ_RETRY_BASE_DELAY,
-    retry_max_delay=GROQ_RETRY_MAX_DELAY,
-)
+recognizer = HybridInventoryRecognizer()
 
 
 class CloseTicketView(discord.ui.View):
@@ -318,16 +431,13 @@ class CloseTicketView(discord.ui.View):
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.channel:
             return
-
         member = interaction.user if isinstance(interaction.user, discord.Member) else None
         has_staff = False
         if member and STAFF_ROLE_ID_INT:
             has_staff = any(role.id == STAFF_ROLE_ID_INT for role in member.roles)
-
         if not has_staff and not interaction.user.guild_permissions.manage_channels:
             await interaction.response.send_message('У тебя нет прав закрывать этот тикет.', ephemeral=True)
             return
-
         await interaction.response.send_message('Тикет будет удален через 5 секунд.', ephemeral=True)
         store.close_by_channel(interaction.channel.id)
         await asyncio.sleep(5)
@@ -349,19 +459,16 @@ class SellBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         self.add_view(CloseTicketView())
-
         if GUILD_ID_INT:
             guild_obj = discord.Object(id=GUILD_ID_INT)
             self.tree.add_command(build_sell_command(), guild=guild_obj)
             self.tree.add_command(ping_command, guild=guild_obj)
-
             if SYNC_COMMANDS_ON_START:
                 synced = await self.tree.sync(guild=guild_obj)
                 logger.info('Синхронизировано %s команд в guild %s', len(synced), GUILD_ID_INT)
         else:
             self.tree.add_command(build_sell_command())
             self.tree.add_command(ping_command)
-
             if SYNC_COMMANDS_ON_START:
                 synced = await self.tree.sync()
                 logger.info('Глобально синхронизировано %s команд', len(synced))
@@ -375,8 +482,7 @@ bot = SellBot()
 
 def build_price_block(lines: list[ResourceLine], total: int, note: str) -> str:
     if not lines:
-        return f'```yaml\nРасчет: предмет не распознан\nИтог: {total} {CURRENCY_NAME}\nПримечание: {note}\n```'
-
+        return f'```yaml\nРасчет: предметы не распознаны\nИтог: {total} {CURRENCY_NAME}\nПримечание: {note}\n```'
     parts = [f'{line.name}: {line.amount} x {line.price_per_unit} = {line.subtotal}' for line in lines]
     joined = '\n'.join(parts)
     return f'```yaml\n{joined}\nИтог: {total} {CURRENCY_NAME}\nПримечание: {note}\n```'
@@ -386,28 +492,18 @@ async def create_ticket_channel(guild: discord.Guild, user: discord.Member, nick
     category = guild.get_channel(TICKETS_CATEGORY_ID_INT) if TICKETS_CATEGORY_ID_INT else None
     if category is not None and not isinstance(category, discord.CategoryChannel):
         raise RuntimeError('TICKETS_CATEGORY_ID указывает не на категорию')
-
     staff_role = guild.get_role(STAFF_ROLE_ID_INT) if STAFF_ROLE_ID_INT else None
-
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
         user: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, read_message_history=True),
         guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, attach_files=True, read_message_history=True),
     }
-
     if staff_role:
         overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-
     channel_name = f'{TICKET_CHANNEL_PREFIX}-{slugify(nick)}-{user.id}'
     if len(channel_name) > 95:
         channel_name = channel_name[:95]
-
-    return await guild.create_text_channel(
-        name=channel_name,
-        category=category,
-        overwrites=overwrites,
-        topic=f'Sell ticket | user={user.id} | nick={nick}'
-    )
+    return await guild.create_text_channel(name=channel_name, category=category, overwrites=overwrites, topic=f'Sell ticket | user={user.id} | nick={nick}')
 
 
 def build_sell_command() -> app_commands.Command:
@@ -417,29 +513,19 @@ def build_sell_command() -> app_commands.Command:
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message('Эту команду можно использовать только на сервере.', ephemeral=True)
             return
-
         if SELL_COMMAND_CHANNEL_ID_INT and interaction.channel_id != SELL_COMMAND_CHANNEL_ID_INT:
-            await interaction.response.send_message(
-                f'Эту команду можно использовать только в канале <#{SELL_COMMAND_CHANNEL_ID_INT}>.',
-                ephemeral=True
-            )
+            await interaction.response.send_message(f'Эту команду можно использовать только в канале <#{SELL_COMMAND_CHANNEL_ID_INT}>.', ephemeral=True)
             return
-
         if MAX_ACTIVE_TICKETS_PER_USER > 0:
             active_count = store.count_active_for_user(interaction.user.id)
             if active_count >= MAX_ACTIVE_TICKETS_PER_USER:
-                await interaction.response.send_message(
-                    f'У тебя уже есть открытая заявка. Максимум активных тикетов: {MAX_ACTIVE_TICKETS_PER_USER}.',
-                    ephemeral=True,
-                )
+                await interaction.response.send_message(f'У тебя уже есть открытая заявка. Максимум активных тикетов: {MAX_ACTIVE_TICKETS_PER_USER}.', ephemeral=True)
                 return
-
         if not screenshot.content_type or not screenshot.content_type.startswith('image/'):
             await interaction.response.send_message('Нужно прикрепить именно изображение.', ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
-
         try:
             ticket_channel = await create_ticket_channel(interaction.guild, interaction.user, nick)
         except Exception as e:
@@ -455,17 +541,13 @@ def build_sell_command() -> app_commands.Command:
             total = 0
             note = f'Не удалось распознать предметы: {e}'
 
-        embed = discord.Embed(
-            title='Новая заявка на продажу ресурсов',
-            color=discord.Color.blurple(),
-            timestamp=datetime.now(timezone.utc),
-        )
+        embed = discord.Embed(title='Новая заявка на продажу ресурсов', color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
         embed.add_field(name='Пользователь', value=f'{interaction.user.mention} (`{interaction.user.id}`)', inline=False)
         embed.add_field(name='Игровой ник', value=discord.utils.escape_markdown(nick), inline=False)
         embed.add_field(name='Скриншот', value=f'[{screenshot.filename}]({screenshot.url})', inline=False)
         embed.add_field(name='Статус', value='Открыт', inline=True)
         embed.set_image(url=screenshot.url)
-        embed.set_footer(text='Распознавание через Groq Vision')
+        embed.set_footer(text='Распознавание: OCR количества + Groq по отдельным ячейкам')
 
         content_parts = []
         if STAFF_ROLE_ID_INT:
@@ -477,7 +559,6 @@ def build_sell_command() -> app_commands.Command:
 
         price_text = build_price_block(lines, total, note)
         view = CloseTicketView()
-
         message = await ticket_channel.send(content=header, embed=embed, view=view)
         await ticket_channel.send(price_text)
 
@@ -493,11 +574,10 @@ def build_sell_command() -> app_commands.Command:
             'currency': CURRENCY_NAME,
             'status': 'open',
             'created_at': datetime.now(timezone.utc).isoformat(),
-            'recognizer': 'groq',
+            'recognizer': 'hybrid_groq_ocr',
             'groq_model': GROQ_MODEL,
         }
         store.append(record)
-
         await interaction.followup.send(f'Готово. Тикет создан: {ticket_channel.mention}', ephemeral=True)
 
     return sell_resources
