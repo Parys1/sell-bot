@@ -128,27 +128,82 @@ class ItemRecognizer:
     def _canonical_name(self, template_name: str) -> str:
         return TEMPLATE_ALIASES.get(template_name, template_name)
 
-    def _feature_from_rgba(self, image: np.ndarray) -> np.ndarray:
-        h, w = image.shape[:2]
-        x0 = max(0, int(w * 0.08))
-        x1 = min(w, int(w * 0.92))
-        y0 = max(0, int(h * 0.10))
-        y1 = min(h, int(h * 0.78))
-        rgb = image[y0:y1, x0:x1, :3]
+    def _read_rgba(self, raw: np.ndarray) -> np.ndarray:
+        if raw.ndim == 2:
+            return cv2.cvtColor(raw, cv2.COLOR_GRAY2RGBA)
+        if raw.shape[2] == 4:
+            return cv2.cvtColor(raw, cv2.COLOR_BGRA2RGBA)
+        return cv2.cvtColor(raw, cv2.COLOR_BGR2RGBA)
 
-        if image.shape[2] == 4:
-            alpha = image[y0:y1, x0:x1, 3:4].astype(np.float32) / 255.0
-            bg = np.full_like(rgb, 32)
-            rgb = (rgb.astype(np.float32) * alpha + bg.astype(np.float32) * (1 - alpha)).astype(np.uint8)
+    def _extract_icon_rgba(self, image: np.ndarray, *, is_template: bool) -> np.ndarray:
+        rgba = image.copy()
+        h, w = rgba.shape[:2]
 
+        if not is_template:
+            overlay_w = max(12, int(w * 0.34))
+            overlay_h = max(12, int(h * 0.26))
+            rgba[0:overlay_h, w - overlay_w:w, :3] = 24
+
+        alpha_mask: np.ndarray | None = None
+        if rgba.shape[2] == 4:
+            alpha_mask = rgba[:, :, 3] > 20
+
+        if alpha_mask is None or int(alpha_mask.sum()) < 30:
+            gray = cv2.cvtColor(rgba[:, :, :3], cv2.COLOR_RGB2GRAY)
+            gray = cv2.GaussianBlur(gray, (3, 3), 0)
+            _, mask = cv2.threshold(gray, 18, 255, cv2.THRESH_BINARY)
+            kernel = np.ones((3, 3), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            coords = cv2.findNonZero(mask)
+            if coords is None:
+                x0, y0, x1, y1 = 0, 0, w, h
+            else:
+                x, y, bw, bh = cv2.boundingRect(coords)
+                pad = max(2, int(min(bw, bh) * 0.06))
+                x0, y0 = max(0, x - pad), max(0, y - pad)
+                x1, y1 = min(w, x + bw + pad), min(h, y + bh + pad)
+        else:
+            ys, xs = np.where(alpha_mask)
+            x0, x1 = int(xs.min()), int(xs.max()) + 1
+            y0, y1 = int(ys.min()), int(ys.max()) + 1
+            pad = max(2, int(min(x1 - x0, y1 - y0) * 0.06))
+            x0, y0 = max(0, x0 - pad), max(0, y0 - pad)
+            x1, y1 = min(w, x1 + pad), min(h, y1 + pad)
+
+        cropped = rgba[y0:y1, x0:x1].copy()
+        ch, cw = cropped.shape[:2]
+        if ch == 0 or cw == 0:
+            return cv2.resize(rgba, (96, 96), interpolation=cv2.INTER_AREA)
+
+        side = max(ch, cw)
+        canvas = np.zeros((side, side, 4), dtype=np.uint8)
+        canvas[:, :, :3] = 24
+        canvas[:, :, 3] = 255
+        oy = (side - ch) // 2
+        ox = (side - cw) // 2
+        canvas[oy:oy + ch, ox:ox + cw] = cropped
+        return cv2.resize(canvas, (96, 96), interpolation=cv2.INTER_AREA)
+
+    def _feature_from_rgba(self, image: np.ndarray, *, is_template: bool) -> np.ndarray:
+        icon = self._extract_icon_rgba(image, is_template=is_template)
+        rgb = icon[:, :, :3]
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-        gray = cv2.resize(gray, (64, 64), interpolation=cv2.INTER_AREA)
-        edges = cv2.Canny(gray, 50, 150)
+        gray_small = cv2.resize(gray, (48, 48), interpolation=cv2.INTER_AREA)
+        edges = cv2.Canny(gray_small, 40, 140)
+
+        lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+        hist_parts: list[np.ndarray] = []
+        for channel in range(3):
+            hist = cv2.calcHist([lab], [channel], None, [16], [0, 256]).flatten()
+            hist = hist / (hist.sum() + 1e-6)
+            hist_parts.append(hist.astype(np.float32))
 
         return np.concatenate([
-            gray.astype(np.float32).flatten() / 255.0,
-            edges.astype(np.float32).flatten() / 255.0,
-        ])
+            gray_small.astype(np.float32).flatten() / 255.0,
+            (edges.astype(np.float32).flatten() / 255.0) * 0.8,
+            np.concatenate(hist_parts),
+        ]).astype(np.float32)
 
     def _load_templates(self) -> None:
         if not self.templates_dir.exists():
@@ -160,7 +215,7 @@ class ItemRecognizer:
                 logger.warning('Не удалось загрузить шаблон %s', path)
                 continue
 
-            rgba = cv2.cvtColor(raw, cv2.COLOR_BGRA2RGBA) if raw.shape[2] == 4 else cv2.cvtColor(raw, cv2.COLOR_BGR2RGBA)
+            rgba = self._read_rgba(raw)
             template_name = path.stem.lower()
             canonical_name = self._canonical_name(template_name)
             price = ITEM_PRICES.get(canonical_name)
@@ -173,7 +228,7 @@ class ItemRecognizer:
                 'template_name': template_name,
                 'name': canonical_name,
                 'price': price,
-                'feature': self._feature_from_rgba(rgba),
+                'feature': self._feature_from_rgba(rgba, is_template=True),
             })
 
         if not self.templates:
@@ -186,22 +241,24 @@ class ItemRecognizer:
         if raw is None:
             raise ValueError('Не удалось прочитать изображение')
 
-        rgba = cv2.cvtColor(raw, cv2.COLOR_BGRA2RGBA) if raw.shape[2] == 4 else cv2.cvtColor(raw, cv2.COLOR_BGR2RGBA)
-        query_feature = self._feature_from_rgba(rgba)
+        rgba = self._read_rgba(raw)
+        query_feature = self._feature_from_rgba(rgba, is_template=False)
 
-        best: dict[str, Any] | None = None
-        best_distance = float('inf')
-
+        scored: list[tuple[float, dict[str, Any]]] = []
         for template in self.templates:
             distance = float(np.mean((query_feature - template['feature']) ** 2))
-            if distance < best_distance:
-                best_distance = distance
-                best = template
+            scored.append((distance, template))
 
-        if best is None:
-            raise RuntimeError('Не удалось сопоставить предмет')
+        scored.sort(key=lambda item: item[0])
+        best_distance, best = scored[0]
 
-        confidence = max(0.0, 1.0 - min(best_distance / 0.20, 1.0))
+        if len(scored) > 1:
+            second_distance = scored[1][0]
+        else:
+            second_distance = best_distance + 1e-6
+
+        margin = max(second_distance - best_distance, 1e-6)
+        confidence = max(0.0, min(1.0, 0.55 + margin * 6.0 - best_distance * 2.5))
         return best['name'], best['price'], confidence
 
     def extract_count(self, image_bytes: bytes) -> tuple[int | None, str]:
